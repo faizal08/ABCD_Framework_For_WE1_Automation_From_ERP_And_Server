@@ -1,0 +1,19 @@
+# IDE Specific Files
+.idea/
+.vscode/
+.classpath
+.factorypath
+.project
+.settings/
+
+# Ignore Build Directories
+/target/
+/bin/
+
+# Ignore Test Reports & Screenshots
+test-reports/
+
+# Secret environment properties
+secret.properties
+secrets.properties
+*.secret.properties
