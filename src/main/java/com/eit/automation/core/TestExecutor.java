@@ -118,6 +118,7 @@ public class TestExecutor {
 
 		ChromeOptions options = new ChromeOptions();
 
+		// Security, autofill, and password manager pop-up suppressions
 		Map<String, Object> prefs = new HashMap<>();
 		prefs.put("credentials_enable_service", false);
 		prefs.put("profile.password_manager_enabled", false);
@@ -129,6 +130,21 @@ public class TestExecutor {
 		options.addArguments("--disable-features=SafeBrowsingPasswordCheck");
 		options.setExperimentalOption("detach", true);
 		options.setExperimentalOption("excludeSwitches", new String[]{"enable-automation"});
+
+		// Source-based execution mode (ERP Headless vs Excel Local)
+		String source = System.getProperty("source", "excel").toLowerCase();
+		if ("erp".equals(source)) {
+			log("🌐 [TestExecutor] ERP Execution Mode: Configuring Headless Chrome for CI/CD...");
+			options.addArguments("--headless=new");
+			options.addArguments("--no-sandbox");
+			options.addArguments("--disable-dev-shm-usage"); // Prevents shared memory crashes in Linux containers
+			options.addArguments("--disable-gpu");
+			options.addArguments("--window-size=1920,1080");
+			options.addArguments("--remote-allow-origins=*");
+		} else {
+			log("🖥️ [TestExecutor] Excel Local Mode: Launching Interactive Browser Window...");
+			options.addArguments("--start-maximized");
+		}
 
 		WebDriver newDriver = new ChromeDriver(options);
 		WebDriverWait newWait = new WebDriverWait(newDriver, Duration.ofSeconds(30));
