@@ -21,7 +21,7 @@ public class AndroidEmulatorManager {
 
     private static final String DEFAULT_SYS_IMAGE = "system-images;android-33;google_apis;x86_64";
     private static final String DEFAULT_DEVICE_PROFILE = "pixel_4";
-    private static final int BOOT_TIMEOUT_SECONDS = 120;
+    private static final int BOOT_TIMEOUT_SECONDS = 300;
 
     /**
      * Main self-healing entry point. Ensures the target emulator is booted and ready.

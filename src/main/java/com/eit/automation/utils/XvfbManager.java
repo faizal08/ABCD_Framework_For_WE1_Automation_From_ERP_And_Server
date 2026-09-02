@@ -4,11 +4,13 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Manages Virtual X11 Display (Xvfb) and FFmpeg Video Screen Recording
- * for Headless Browser Execution in Linux/Docker environments.
+ * for Headless Browser/Mobile Execution across Linux (Docker/CI) and Windows (Local).
  * Package: com.eit.automation.utils
  */
 public class XvfbManager {
@@ -21,25 +23,28 @@ public class XvfbManager {
     private static String activeDisplay = DEFAULT_DISPLAY;
 
     private static boolean isLinux() {
-        return System.getProperty("os.name").toLowerCase().contains("nix") ||
-                System.getProperty("os.name").toLowerCase().contains("nux") ||
-                System.getProperty("os.name").toLowerCase().contains("aix");
+        String os = System.getProperty("os.name").toLowerCase();
+        return os.contains("nix") || os.contains("nux") || os.contains("aix");
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name").toLowerCase().contains("win");
     }
 
     /**
-     * Starts Xvfb Server on default display :99 (1920x1080x24)
+     * Starts Xvfb Server on default display :99 (1920x1080x24) - Linux only.
      */
     public static synchronized boolean startXvfb() {
         return startXvfb(DEFAULT_DISPLAY, DEFAULT_RESOLUTION);
     }
 
     /**
-     * Starts Xvfb Server on specified display port and resolution.
+     * Starts Xvfb Server on specified display port and resolution (Linux only).
      * Example: startXvfb(":99", "1920x1080x24")
      */
     public static synchronized boolean startXvfb(String displayNum, String resolution) {
         if (!isLinux()) {
-            System.out.println("ℹ️ OS is not Linux. Skipping Xvfb virtual display initialization.");
+            System.out.println("ℹ️ OS is not Linux (" + System.getProperty("os.name") + "). Skipping Xvfb virtual display initialization.");
             return false;
         }
 
@@ -78,18 +83,14 @@ public class XvfbManager {
     }
 
     /**
-     * Starts FFmpeg screen recording of the active Xvfb virtual display.
+     * Starts FFmpeg screen recording.
+     * Uses x11grab on Linux (capturing Xvfb) and gdigrab on Windows (capturing desktop).
      *
      * @param outputVideoFilePath Path where MP4 video will be written.
      * @param videoWidthHeight    Resolution string e.g. "1920x1080"
      * @param fps                 Frames per second (e.g., 24 or 30)
      */
     public static synchronized boolean startRecording(String outputVideoFilePath, String videoWidthHeight, int fps) {
-        if (!isLinux()) {
-            System.out.println("ℹ️ Skipping FFmpeg X11 capture (Not running on Linux/X11).");
-            return false;
-        }
-
         if (ffmpegProcess != null && ffmpegProcess.isAlive()) {
             System.out.println("⚠️ FFmpeg recording is already active.");
             return true;
@@ -103,28 +104,43 @@ public class XvfbManager {
 
             System.out.println("🎬 Starting FFmpeg video recording -> " + outputVideoFilePath);
 
-            // FFmpeg command using x11grab on Xvfb display
-            ProcessBuilder pb = new ProcessBuilder(
-                    "ffmpeg",
-                    "-y",                           // Overwrite existing output file
-                    "-video_size", videoWidthHeight, // e.g. "1920x1080"
-                    "-framerate", String.valueOf(fps),
-                    "-f", "x11grab",                // X11 Screen Capture engine
-                    "-i", activeDisplay + ".0",     // Input Display (e.g. :99.0)
-                    "-c:v", "libx264",              // Standard MP4 H.264 codec
-                    "-preset", "ultrafast",         // Low CPU footprint during test run
-                    "-pix_fmt", "yuv420p",          // High browser and cloud preview compatibility
-                    outputVideoFilePath
-            );
+            List<String> command = new ArrayList<>();
+            command.add("ffmpeg");
+            command.add("-y"); // Overwrite existing file
 
+            if (isLinux()) {
+                // Linux / Docker CI/CD (Grabs Xvfb virtual screen buffer)
+                System.out.println("🐧 Linux OS detected: Using x11grab engine on display " + activeDisplay);
+                command.add("-video_size"); command.add(videoWidthHeight);
+                command.add("-framerate");  command.add(String.valueOf(fps));
+                command.add("-f");          command.add("x11grab");
+                command.add("-i");          command.add(activeDisplay + ".0");
+            } else if (isWindows()) {
+                // Windows OS (Grabs desktop screen via gdigrab engine)
+                System.out.println("🪟 Windows OS detected: Using gdigrab desktop engine");
+                command.add("-f");          command.add("gdigrab");
+                command.add("-framerate");  command.add(String.valueOf(fps));
+                command.add("-i");          command.add("desktop");
+            } else {
+                System.err.println("❌ Unsupported Operating System for FFmpeg screen capture.");
+                return false;
+            }
+
+            // Common Encoding Options for H.264 MP4 Output
+            command.add("-c:v");     command.add("libx264");
+            command.add("-preset");  command.add("ultrafast");
+            command.add("-pix_fmt"); command.add("yuv420p");
+            command.add(outputVideoFilePath);
+
+            ProcessBuilder pb = new ProcessBuilder(command);
             pb.redirectErrorStream(true);
             ffmpegProcess = pb.start();
 
-            // Background thread to drain process output buffer
+            // Background thread to drain process output stream (prevents OS buffer locking)
             new Thread(() -> {
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(ffmpegProcess.getInputStream()))) {
                     while (reader.readLine() != null) {
-                        // Consuming stdout/stderr to prevent buffer overflow freeze
+                        // Consuming stdout/stderr buffer continuously
                     }
                 } catch (Exception ignored) {}
             }).start();
@@ -135,7 +151,7 @@ public class XvfbManager {
                 System.out.println("🎥 FFmpeg video recording started successfully.");
                 return true;
             } else {
-                System.err.println("❌ FFmpeg failed to start recording.");
+                System.err.println("❌ FFmpeg failed to start recording. Verify FFmpeg is installed and accessible in PATH.");
                 return false;
             }
 
@@ -146,13 +162,13 @@ public class XvfbManager {
     }
 
     /**
-     * Stops FFmpeg recording gracefully by sending 'q' signal to write MP4 atom headers.
+     * Stops FFmpeg recording gracefully by sending 'q' signal to write MP4 atom headers properly.
      */
     public static synchronized void stopRecording() {
         if (ffmpegProcess != null && ffmpegProcess.isAlive()) {
             System.out.println("🛑 Stopping FFmpeg video recording...");
             try {
-                // Graceful quit signal for FFmpeg to finalize MP4 file index
+                // Graceful quit signal for FFmpeg to finalize MP4 container headers
                 OutputStream os = ffmpegProcess.getOutputStream();
                 os.write("q\n".getBytes());
                 os.flush();
@@ -161,7 +177,7 @@ public class XvfbManager {
                 if (!exited) {
                     ffmpegProcess.destroyForcibly();
                 }
-                System.out.println("✅ FFmpeg recording stopped and finalized.");
+                System.out.println("✅ FFmpeg recording stopped and video finalized.");
             } catch (Exception e) {
                 System.err.println("⚠️ Error while gracefully stopping FFmpeg: " + e.getMessage());
                 ffmpegProcess.destroyForcibly();
@@ -172,10 +188,10 @@ public class XvfbManager {
     }
 
     /**
-     * Stops Xvfb virtual display process.
+     * Stops Xvfb virtual display process (if running on Linux).
      */
     public static synchronized void stopXvfb() {
-        stopRecording(); // Always stop recording first if running
+        stopRecording(); // Always ensure video recording is stopped first
 
         if (xvfbProcess != null && xvfbProcess.isAlive()) {
             System.out.println("🔌 Shutting down Xvfb virtual display (" + activeDisplay + ")...");

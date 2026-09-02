@@ -7,6 +7,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 import com.eit.automation.parser.StepParser;
+import com.eit.automation.utils.XvfbManager;
 import org.openqa.selenium.*;
 import io.appium.java_client.AppiumBy;
 import org.openqa.selenium.interactions.PointerInput;
@@ -42,6 +43,11 @@ import com.eit.automation.actions.WaitActions;
 import com.eit.automation.parser.TestStep;
 import com.eit.automation.utils.ReportGenerator;
 import com.eit.automation.utils.DatabaseUtils;
+
+import io.appium.java_client.service.local.AppiumDriverLocalService;
+import io.appium.java_client.service.local.AppiumServiceBuilder;
+import io.appium.java_client.service.local.flags.GeneralServerFlag;
+
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -54,6 +60,8 @@ public class TestExecutor {
 	private Map<String, WebDriver> driverPool = new HashMap<>();
 	private Map<String, WebDriverWait> waitPool = new HashMap<>();
 	private String currentSessionRole = "web";
+
+	private static AppiumDriverLocalService appiumService;
 
 	private boolean isHybridFlow = false;
 	private WaitActions waitActions;
@@ -166,10 +174,94 @@ public class TestExecutor {
 		log("✓ Web Session [web] successfully registered in universal context pools.");
 	}
 
+	private void ensureAppiumServerRunning() {
+		try {
+			String appiumUrlStr = config.getProperty("appium.url", "http://127.0.0.1:4723/");
+			URL appiumUrl = new URL(appiumUrlStr);
+			int port = appiumUrl.getPort() != -1 ? appiumUrl.getPort() : 4723;
+			String host = appiumUrl.getHost();
+
+			// Check if Appium Server is already listening on the port
+			try (java.net.Socket socket = new java.net.Socket(host, port)) {
+				log("⚡ Appium Server is already running on port " + port);
+				return;
+			} catch (Exception notRunning) {
+				log("🚀 Appium Server is not running. Starting programmatic Appium Service on port " + port + "...");
+			}
+
+			// Programmatically start Appium Service
+			AppiumServiceBuilder builder = new AppiumServiceBuilder()
+					.withIPAddress(host)
+					.usingPort(port)
+					.withArgument(GeneralServerFlag.RELAXED_SECURITY)
+					.withTimeout(Duration.ofMinutes(2));
+
+			appiumService = AppiumDriverLocalService.buildService(builder);
+			appiumService.start();
+
+			if (appiumService.isRunning()) {
+				log("✅ Appium Server started successfully at: " + appiumService.getUrl());
+			} else {
+				throw new RuntimeException("❌ Failed to start programmatic Appium Server!");
+			}
+
+		} catch (Exception e) {
+			log("❌ Error initializing programmatic Appium Server: " + e.getMessage());
+			throw new RuntimeException("Could not launch Appium Server automatically", e);
+		}
+	}
+
 	public void setupMobileDriver(String role) {
 		String cleanRole = role.toLowerCase().trim();
 		log("📱 Initializing Mobile Emulator for Role: [" + cleanRole.toUpperCase() + "]");
 
+		String source = System.getProperty("source", "excel").toLowerCase();
+
+		// -----------------------------------------------------------------
+		// ERP SERVER RUN ORCHESTRATION: Mobile & Virtual Display Services
+		// -----------------------------------------------------------------
+		if ("erp".equals(source)) {
+			log("🌐 [ERP Mode] Initializing Mobile & Virtual Display Services...");
+
+			// 1. Force Visible property for AndroidEmulatorManager (Temporary for visual debugging)
+			if (config != null) {
+				config.setProperty("headless", "false");
+			}
+
+			// 2. Start Virtual X11 Display & Video Recording if running on Linux
+			XvfbManager.startXvfb(":99", "1920x1080x24");
+			String videoPath = "target/recordings/ERP_Execution_" + cleanRole + "_" + System.currentTimeMillis() + ".mp4";
+			XvfbManager.startRecording(videoPath, "1920x1080", 24);
+
+			// 3. Resolve AVD Name and Port dynamically from Config (with standard fallbacks)
+			String avdName = config.getProperty(cleanRole + ".avd.name", "Pixel_4_API_33");
+
+			// Extract port from targetUdid (e.g. "emulator-5554" -> 5554)
+			String targetUdid = config.getProperty(cleanRole + ".device.id", "emulator-5554");
+			int port = 5554;
+			if (targetUdid.contains("-")) {
+				try {
+					port = Integer.parseInt(targetUdid.split("-")[1]);
+				} catch (Exception ignored) {}
+			}
+
+			// 4. Trigger Self-Healing CLI boot (Visible UI mode)
+			boolean isHealthy = AndroidEmulatorManager.ensureEmulatorHealthy(avdName, port);
+			if (!isHealthy) {
+				throw new RuntimeException("❌ [Fatal] Could not spin up healthy Android Emulator for AVD: " + avdName);
+			}
+		} else {
+			log("🖥️ [Excel Local Mode] Connecting to active visual emulator session...");
+		}
+
+		// -----------------------------------------------------------------
+		// PROGRAMMATIC APPIUM SERVER AUTO-START CHECK
+		// -----------------------------------------------------------------
+		ensureAppiumServerRunning();
+
+		// -----------------------------------------------------------------
+		// APPIUM DRIVER INITIALIZATION (Identical for ERP & Excel Modes)
+		// -----------------------------------------------------------------
 		try {
 			io.appium.java_client.android.options.UiAutomator2Options options = new io.appium.java_client.android.options.UiAutomator2Options();
 
@@ -197,17 +289,31 @@ public class TestExecutor {
 			options.setNewCommandTimeout(Duration.ofMinutes(10));
 			options.setCapability("autoDismissAlerts", true);
 			options.setCapability("appium:waitForIdleTimeout", 0);
-			options.setCapability("appium:unicodeKeyboard", true);
-			options.setCapability("appium:resetKeyboard", true);
+
+			// Disable legacy IME keyboard reset to prevent session crash on wiped/fresh emulators
+			options.setCapability("appium:unicodeKeyboard", false);
+			options.setCapability("appium:resetKeyboard", false);
+
+			// Allow up to 5 minutes for slow AVD boots to stabilize before timing out
+			options.setCapability("appium:avdLaunchTimeout", 300000);
+			options.setCapability("appium:avdReadyTimeout", 300000);
+
 			options.setCapability("skipDeviceInitialization", false);
 			options.setCapability("skipServerInstallation", false);
 
 			URL url = new URL(config.getProperty("appium.url"));
-			AndroidDriver mobileDriver = new AndroidDriver(url, options);
+
+			// Configure Java HTTP Client timeouts to prevent java.net.ConnectException / ClosedChannelException
+			org.openqa.selenium.remote.http.ClientConfig clientConfig = org.openqa.selenium.remote.http.ClientConfig.defaultConfig()
+					.baseUrl(url)
+					.readTimeout(Duration.ofMinutes(5))
+					.connectionTimeout(Duration.ofMinutes(5));
+
+			AndroidDriver mobileDriver = new AndroidDriver(clientConfig, options);
 
 			log("⏳ Waiting for app package [" + cleanRole + "] to launch...");
-			WebDriverWait launchWait = new WebDriverWait(mobileDriver, Duration.ofSeconds(20));
-			launchWait.until(d -> ((AndroidDriver)d).getCurrentPackage() != null);
+			WebDriverWait launchWait = new WebDriverWait(mobileDriver, Duration.ofSeconds(30));
+			launchWait.until(d -> ((AndroidDriver) d).getCurrentPackage() != null);
 
 			driverPool.put(cleanRole, mobileDriver);
 			WebDriverWait mobileWait = new WebDriverWait(mobileDriver, Duration.ofSeconds(30));
@@ -219,6 +325,7 @@ public class TestExecutor {
 				this.currentSessionRole = cleanRole;
 			}
 
+			refreshActionHandlers();
 			log("✅ Mobile session started and stabilized for role: [" + cleanRole + "] on device: " + targetUdid);
 
 		} catch (Exception e) {
@@ -257,7 +364,6 @@ public class TestExecutor {
 				mobileActions, pageObjectManager, isCleanupMode, this
 		);
 	}
-
 	public boolean run(String sheetName, List<TestStep> steps, String testCaseName) {
 		long testStartTime = System.currentTimeMillis();
 
@@ -537,6 +643,11 @@ public class TestExecutor {
 		}
 	}
 
+	// =================================================================
+	// PROGRAMMATIC APPIUM SERVICE TEARDOWN
+	// =================================================================
+
+
 	public void close() {
 		log("");
 		log("╔════════════════════════════════════════════════════════════════════════════════╗");
@@ -563,8 +674,30 @@ public class TestExecutor {
 			log("✓ Driver closed");
 		}
 
+		// 2. Stop ERP Mode Virtual Display & Video Recording Services
+		String source = System.getProperty("source", "excel").toLowerCase();
+		if ("erp".equals(source)) {
+			log("🌐 [ERP Mode] Cleaning up virtual display & video recording processes...");
+			try {
+				XvfbManager.stopRecording();
+				XvfbManager.stopXvfb();
+				log("✓ Xvfb display and recording services stopped successfully.");
+			} catch (Exception e) {
+				log("⚠ Error stopping Xvfb/Recording: " + e.getMessage());
+			}
+		}
+
+		stopAppiumServer();
 		log("");
 	}
+
+	public static void stopAppiumServer() {
+		if (appiumService != null && appiumService.isRunning()) {
+			appiumService.stop();
+			System.out.println("🛑 Appium Server stopped successfully.");
+		}
+	}
+
 
 	public WebDriver getDriver() {
 		return driver;
