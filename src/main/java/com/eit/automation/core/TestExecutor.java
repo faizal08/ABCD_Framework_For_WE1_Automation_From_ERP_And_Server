@@ -14,12 +14,13 @@ import org.openqa.selenium.interactions.PointerInput;
 import org.openqa.selenium.interactions.Sequence;
 import org.openqa.selenium.interactions.Pause;
 
-import java.time.Duration;
 import java.util.Collections;
 
 import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
 import org.openqa.selenium.interactions.Actions;
+import org.openqa.selenium.remote.RemoteWebDriver;
+import org.openqa.selenium.HasCapabilities;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 import io.appium.java_client.AppiumDriver;
@@ -30,7 +31,6 @@ import org.openqa.selenium.remote.DesiredCapabilities;
 import java.net.URL;
 import com.eit.automation.actions.MobileActions;
 import java.util.ArrayList;
-import java.util.Collections;
 
 import com.eit.automation.actions.ClickActions;
 import com.eit.automation.actions.FileActions;
@@ -298,6 +298,13 @@ public class TestExecutor {
 			options.setCapability("appium:avdLaunchTimeout", 300000);
 			options.setCapability("appium:avdReadyTimeout", 300000);
 
+			// -----------------------------------------------------------------
+			// ADB & UIAUTOMATOR2 INSTALLATION TIMEOUT FIXES
+			// -----------------------------------------------------------------
+			options.setCapability("appium:uiautomator2ServerInstallTimeout", 60000);
+			options.setCapability("appium:adbExecTimeout", 60000);
+			options.setCapability("appium:uiautomator2ServerLaunchTimeout", 60000);
+
 			options.setCapability("skipDeviceInitialization", false);
 			options.setCapability("skipServerInstallation", false);
 
@@ -364,6 +371,7 @@ public class TestExecutor {
 				mobileActions, pageObjectManager, isCleanupMode, this
 		);
 	}
+
 	public boolean run(String sheetName, List<TestStep> steps, String testCaseName) {
 		long testStartTime = System.currentTimeMillis();
 
@@ -564,7 +572,13 @@ public class TestExecutor {
 			long testDuration = System.currentTimeMillis() - testStartTime;
 			logTestSummary(testCaseName, testDuration);
 
-			return failedSteps == 0;
+			boolean isSuccess = (failedSteps == 0);
+			if (!isSuccess) {
+				log("⚠️ Test failed. Purging crashed driver sessions while retaining Appium server...");
+				purgeDeadSessions();
+			}
+
+			return isSuccess;
 
 		} catch (Exception e) {
 			long testDuration = System.currentTimeMillis() - testStartTime;
@@ -574,12 +588,40 @@ public class TestExecutor {
 				reportGenerator.endTestCase(false);
 			}
 
+			log("❌ Critical exception encountered. Purging crashed driver sessions while retaining Appium server...");
+			purgeDeadSessions();
+
 			return false;
 		}
 	}
 
 	public boolean run(List<TestStep> steps) {
 		return run("Default", steps, "Unnamed Test Case");
+	}
+
+	public void purgeDeadSessions() {
+		if (driverPool != null && !driverPool.isEmpty()) {
+			driverPool.entrySet().removeIf(entry -> {
+				try {
+					WebDriver d = entry.getValue();
+					if (d instanceof HasCapabilities) {
+						((HasCapabilities) d).getCapabilities();
+					} else if (d instanceof RemoteWebDriver) {
+						((RemoteWebDriver) d).getCapabilities();
+					} else {
+						// Fallback check to verify session responsiveness
+						d.getWindowHandle();
+					}
+					return false;
+				} catch (Exception ex) {
+					log("⚠️ Purged crashed driver session [" + entry.getKey() + "] from pool.");
+					try {
+						entry.getValue().quit();
+					} catch (Exception ignored) {}
+					return true;
+				}
+			});
+		}
 	}
 
 	public void switchSession(String role) {
@@ -644,9 +686,8 @@ public class TestExecutor {
 	}
 
 	// =================================================================
-	// PROGRAMMATIC APPIUM SERVICE TEARDOWN
+	// PROGRAMMATIC APPIUM SERVICE TEARDOWN & CLEANUP
 	// =================================================================
-
 
 	public void close() {
 		log("");
@@ -670,8 +711,10 @@ public class TestExecutor {
 			driver = null;
 			wait = null;
 		} else if (driver != null) {
-			driver.quit();
-			log("✓ Driver closed");
+			try {
+				driver.quit();
+				log("✓ Driver closed");
+			} catch (Exception ignored) {}
 		}
 
 		// 2. Stop ERP Mode Virtual Display & Video Recording Services
@@ -697,7 +740,6 @@ public class TestExecutor {
 			System.out.println("🛑 Appium Server stopped successfully.");
 		}
 	}
-
 
 	public WebDriver getDriver() {
 		return driver;
@@ -770,11 +812,6 @@ public class TestExecutor {
 		} else {
 			log("║  STATUS: ✗ " + failedSteps + " STEP(S) FAILED                                            ║");
 		}
-		log("╚════════════════════════════════════════════════════════════════════════════════╝");
-		log("");
-		log("→ Browser remains open for inspection");
-		log("→ Call executor.close() when done");
-		log("");
 		log("╚════════════════════════════════════════════════════════════════════════════════╝");
 		log("");
 		log("→ All sessions (Web/Mobile) remain active for inspection");

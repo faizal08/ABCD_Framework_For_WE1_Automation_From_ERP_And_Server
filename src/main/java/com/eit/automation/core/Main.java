@@ -29,6 +29,9 @@ public class Main {
     // Tracks which sessions from the DriverPool have been initialized
     public static Set<String> activeSessions = new HashSet<>();
 
+    // Track if any test case in the suite failed to set exit status at the very end
+    private static boolean hasSuiteFailed = false;
+
     static {
         try {
             videoRecorder = new VideoRecorder();
@@ -232,7 +235,7 @@ public class Main {
             }
 
         } catch (Exception e) {
-            System.err.println("❌ Execution failed: " + e.getMessage());
+            System.err.println("❌ Suite processing exception: " + e.getMessage());
             e.printStackTrace();
             reportGenerator.endTestExecution();
         } finally {
@@ -243,9 +246,18 @@ public class Main {
                     workbook.close();
                 } catch (Exception ignored) {}
             }
+
             if (executor != null) {
-                System.out.println("🛑 Terminating all active automation sessions...");
+                System.out.println("🛑 Terminating all active automation sessions and Appium server...");
                 executor.close();
+            }
+
+            if (hasSuiteFailed) {
+                System.out.println("\n⚠️ Automation suite completed with test failures. Shutting down JVM (exit code 1)...");
+                System.exit(1);
+            } else {
+                System.out.println("\n🔚 All test cases executed successfully! Shutting down JVM (exit code 0)...");
+                System.exit(0);
             }
         }
     }
@@ -391,8 +403,13 @@ public class Main {
                 }
 
             } catch (Exception e) {
-                System.err.println("❌ Error in " + testCaseName + ": " + e.getMessage());
-                e.printStackTrace();
+                hasSuiteFailed = true;
+                System.err.println("❌ Test Case Failure in [" + testCaseName + "]: " + e.getMessage());
+                System.err.println("⏩ Continuing execution to the next test case in sheet...");
+
+                // Safely purge crashed sessions so subsequent test cases start fresh without failing
+                resetFailedDriverSessions();
+
             } finally {
                 try {
                     if (videoRecorder != null && videoRecorder.isRecording()) {
@@ -405,6 +422,16 @@ public class Main {
                     System.err.println("⚠️ Failed to stop video recorder: " + e.getMessage());
                 }
             }
+        }
+    }
+
+    private static void resetFailedDriverSessions() {
+        try {
+            if (executor != null) {
+                executor.purgeDeadSessions();
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ Warning during session pool cleanup: " + e.getMessage());
         }
     }
 
@@ -442,7 +469,10 @@ public class Main {
                 executeTestCase("CSV_Data", testCaseName, stepBlock, executor, reportGenerator);
 
             } catch (Exception e) {
-                System.err.println("❌ CSV Execution Error in " + testCaseName + ": " + e.getMessage());
+                hasSuiteFailed = true;
+                System.err.println("❌ CSV Execution Error in [" + testCaseName + "]: " + e.getMessage());
+                System.err.println("⏩ Continuing execution to next CSV test case...");
+                resetFailedDriverSessions();
             } finally {
                 try {
                     if (videoRecorder != null && videoRecorder.isRecording()) {
@@ -499,6 +529,10 @@ public class Main {
         }
 
         System.out.println("🚀 Handing over synchronized session execution block to TestExecutor engine...");
-        executor.run(sheetName, steps, testCaseName);
+
+        boolean passed = executor.run(sheetName, steps, testCaseName);
+        if (!passed) {
+            throw new RuntimeException("Test step failure encountered during execution of test case: " + testCaseName);
+        }
     }
 }
